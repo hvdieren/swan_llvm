@@ -154,7 +154,44 @@ void CloneAndPruneFunctionInto(Function *NewFunc, const Function *OldFunc,
                                const DataLayout *TD = 0,
                                Instruction *TheCall = 0);
 
-  
+/// A helper class used with CloneAndPruneIntoFromInst to change the default
+/// behavior while instructions are being cloned.
+class CloningDirector {
+public:
+  /// This enumeration describes the way CloneAndPruneIntoFromInst should
+  /// proceed after the CloningDirector has examined an instruction.
+  enum CloningAction {
+    ///< Continue cloning the instruction (default behavior).
+    CloneInstruction,
+    ///< Skip this instruction but continue cloning the current basic block.
+    SkipInstruction,
+    ///< Skip this instruction and stop cloning the current basic block.
+    StopCloningBB,
+    ///< Don't clone the terminator but clone the current block's successors.
+    CloneSuccessors
+  };
+
+  virtual ~CloningDirector() {}
+
+  /// Subclasses must override this function to customize cloning behavior.
+  virtual CloningAction handleInstruction(ValueToValueMapTy &VMap,
+                                          const Instruction *Inst,
+                                          BasicBlock *NewBB) = 0;
+
+  virtual ValueMapTypeRemapper *getTypeRemapper() { return 0; }
+  virtual ValueMaterializer *getValueMaterializer() { return 0; }
+};
+
+void CloneAndPruneIntoFromInst(Function *NewFunc, const Function *OldFunc,
+			       const Instruction *StartingInst,
+			       ValueToValueMapTy &VMap,
+			       bool ModuleLevelChanges,
+			       SmallVectorImpl<ReturnInst *> &Returns,
+			       const DataLayout *TD,
+			       const char *NameSuffix = "", 
+			       ClonedCodeInfo *CodeInfo = 0,
+			       CloningDirector *Director = 0);
+
 /// InlineFunctionInfo - This class captures the data input to the
 /// InlineFunction call, and records the auxiliary results produced by it. 
 class InlineFunctionInfo {

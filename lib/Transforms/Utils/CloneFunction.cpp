@@ -221,6 +221,7 @@ namespace {
     /// CloneBlock - The specified block is found to be reachable, clone it and
     /// anything that it can reach.
     void CloneBlock(const BasicBlock *BB,
+		    BasicBlock::const_iterator StartingInst,
                     std::vector<const BasicBlock*> &ToClone);
   };
 }
@@ -228,6 +229,7 @@ namespace {
 /// CloneBlock - The specified block is found to be reachable, clone it and
 /// anything that it can reach.
 void PruningFunctionCloner::CloneBlock(const BasicBlock *BB,
+				       BasicBlock::const_iterator StartingInst,
                                        std::vector<const BasicBlock*> &ToClone){
   WeakVH &BBEntry = VMap[BB];
 
@@ -259,7 +261,7 @@ void PruningFunctionCloner::CloneBlock(const BasicBlock *BB,
   
   // Loop over all instructions, and copy them over, DCE'ing as we go.  This
   // loop doesn't include the terminator.
-  for (BasicBlock::const_iterator II = BB->begin(), IE = --BB->end();
+  for (BasicBlock::const_iterator II = StartingInst, IE = --BB->end();
        II != IE; ++II) {
     Instruction *NewInst = II->clone();
 
@@ -387,7 +389,7 @@ void llvm::CloneAndPruneFunctionInto(Function *NewFunc, const Function *OldFunc,
   while (!CloneWorklist.empty()) {
     const BasicBlock *BB = CloneWorklist.back();
     CloneWorklist.pop_back();
-    PFC.CloneBlock(BB, CloneWorklist);
+    PFC.CloneBlock(BB, BB->front(), CloneWorklist);
   }
   
   // Loop over all of the basic blocks in the old function.  If the block was
@@ -567,6 +569,248 @@ void llvm::CloneAndPruneFunctionInto(Function *NewFunc, const Function *OldFunc,
   // any return instructions which survived folding. We have to do this here
   // because we can iteratively remove and merge returns above.
   for (Function::iterator I = cast<BasicBlock>(VMap[&OldFunc->getEntryBlock()]),
+                          E = NewFunc->end();
+       I != E; ++I)
+    if (ReturnInst *RI = dyn_cast<ReturnInst>(I->getTerminator()))
+      Returns.push_back(RI);
+}
+
+/// This works like CloneAndPruneFunctionInto, except that it does not clone the
+/// entire function. Instead it starts at an instruction provided by the caller
+/// and copies (and prunes) only the code reachable from that instruction.
+void llvm::CloneAndPruneIntoFromInst(Function *NewFunc, const Function *OldFunc,
+                                     const Instruction *StartingInst,
+                                     ValueToValueMapTy &VMap,
+                                     bool ModuleLevelChanges,
+                                     SmallVectorImpl<ReturnInst *> &Returns,
+                                     const DataLayout *TD,
+                                     const char *NameSuffix, 
+                                     ClonedCodeInfo *CodeInfo,
+                                     CloningDirector *Director) {
+  assert(NameSuffix && "NameSuffix cannot be null!");
+
+  ValueMapTypeRemapper *TypeMapper = 0;
+  ValueMaterializer *Materializer = 0;
+
+  if (Director) {
+    TypeMapper = Director->getTypeRemapper();
+    Materializer = Director->getValueMaterializer();
+  }
+
+#ifndef NDEBUG
+  // If the cloning starts at the begining of the function, verify that
+  // the function arguments are mapped.
+  if (!StartingInst)
+    for (Function::const_arg_iterator II = OldFunc->arg_begin(),
+         E = OldFunc->arg_end(); II != E; ++II)
+      assert(VMap.count(II) && "No mapping from source argument specified!");
+#endif
+
+  PruningFunctionCloner PFC(NewFunc, OldFunc, VMap, ModuleLevelChanges,
+                            NameSuffix, CodeInfo, TD); // Director);
+
+  const BasicBlock *StartingBB;
+  if (StartingInst)
+    StartingBB = StartingInst->getParent();
+  else {
+    StartingBB = &OldFunc->getEntryBlock();
+    StartingInst = StartingBB->begin();
+  }
+
+  // Clone the entry block, and anything recursively reachable from it.
+  std::vector<const BasicBlock*> CloneWorklist;
+  PFC.CloneBlock(StartingBB, StartingInst, CloneWorklist);
+  while (!CloneWorklist.empty()) {
+    const BasicBlock *BB = CloneWorklist.back();
+    CloneWorklist.pop_back();
+    PFC.CloneBlock(BB, BB->begin(), CloneWorklist);
+  }
+  
+  // Loop over all of the basic blocks in the old function.  If the block was
+  // reachable, we have cloned it and the old block is now in the value map:
+  // insert it into the new function in the right order.  If not, ignore it.
+  //
+  // Defer PHI resolution until rest of function is resolved.
+  SmallVector<const PHINode*, 16> PHIToResolve;
+  for (Function::const_iterator BI = OldFunc->begin(), BE = OldFunc->end();
+       BI != BE; ++BI) {
+    Value *V = VMap[BI];
+    BasicBlock *NewBB = cast_or_null<BasicBlock>(V);
+    if (!NewBB) continue;  // Dead block.
+
+    // Add the new block to the new function.
+    NewFunc->getBasicBlockList().push_back(NewBB);
+
+    // Handle PHI nodes specially, as we have to remove references to dead
+    // blocks.
+    for (BasicBlock::const_iterator I = BI->begin(), E = BI->end(); I != E; ++I) {
+      // PHI nodes may have been remapped to non-PHI nodes by the caller or
+      // during the cloning process.
+      if (const PHINode *PN = dyn_cast<PHINode>(I)) {
+        if (isa<PHINode>(VMap[PN]))
+          PHIToResolve.push_back(PN);
+        else
+          break;
+      } else {
+        break;
+      }
+    }
+
+    // Finally, remap the terminator instructions, as those can't be remapped
+    // until all BBs are mapped.
+    RemapInstruction(NewBB->getTerminator(), VMap,
+                     ModuleLevelChanges ? RF_None : RF_NoModuleLevelChanges,
+                     TypeMapper, Materializer);
+  }
+  
+  // Defer PHI resolution until rest of function is resolved, PHI resolution
+  // requires the CFG to be up-to-date.
+  for (unsigned phino = 0, e = PHIToResolve.size(); phino != e; ) {
+    const PHINode *OPN = PHIToResolve[phino];
+    unsigned NumPreds = OPN->getNumIncomingValues();
+    const BasicBlock *OldBB = OPN->getParent();
+    BasicBlock *NewBB = cast<BasicBlock>(VMap[OldBB]);
+
+    // Map operands for blocks that are live and remove operands for blocks
+    // that are dead.
+    for (; phino != PHIToResolve.size() &&
+         PHIToResolve[phino]->getParent() == OldBB; ++phino) {
+      OPN = PHIToResolve[phino];
+      PHINode *PN = cast<PHINode>(VMap[OPN]);
+      for (unsigned pred = 0, e = NumPreds; pred != e; ++pred) {
+        Value *V = VMap[PN->getIncomingBlock(pred)];
+        if (BasicBlock *MappedBlock = cast_or_null<BasicBlock>(V)) {
+          Value *InVal = MapValue(PN->getIncomingValue(pred),
+                                  VMap, 
+                        ModuleLevelChanges ? RF_None : RF_NoModuleLevelChanges);
+          assert(InVal && "Unknown input value?");
+          PN->setIncomingValue(pred, InVal);
+          PN->setIncomingBlock(pred, MappedBlock);
+        } else {
+          PN->removeIncomingValue(pred, false);
+          --pred, --e;  // Revisit the next entry.
+        }
+      } 
+    }
+    
+    // The loop above has removed PHI entries for those blocks that are dead
+    // and has updated others.  However, if a block is live (i.e. copied over)
+    // but its terminator has been changed to not go to this block, then our
+    // phi nodes will have invalid entries.  Update the PHI nodes in this
+    // case.
+    PHINode *PN = cast<PHINode>(NewBB->begin());
+    NumPreds = std::distance(pred_begin(NewBB), pred_end(NewBB));
+    if (NumPreds != PN->getNumIncomingValues()) {
+      assert(NumPreds < PN->getNumIncomingValues());
+      // Count how many times each predecessor comes to this block.
+      std::map<BasicBlock*, unsigned> PredCount;
+      for (pred_iterator PI = pred_begin(NewBB), E = pred_end(NewBB);
+           PI != E; ++PI)
+        --PredCount[*PI];
+      
+      // Figure out how many entries to remove from each PHI.
+      for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)
+        ++PredCount[PN->getIncomingBlock(i)];
+      
+      // At this point, the excess predecessor entries are positive in the
+      // map.  Loop over all of the PHIs and remove excess predecessor
+      // entries.
+      BasicBlock::iterator I = NewBB->begin();
+      for (; (PN = dyn_cast<PHINode>(I)); ++I) {
+        for (std::map<BasicBlock*, unsigned>::iterator PCI =PredCount.begin(),
+             E = PredCount.end(); PCI != E; ++PCI) {
+          BasicBlock *Pred     = PCI->first;
+          for (unsigned NumToRemove = PCI->second; NumToRemove; --NumToRemove)
+            PN->removeIncomingValue(Pred, false);
+        }
+      }
+    }
+    
+    // If the loops above have made these phi nodes have 0 or 1 operand,
+    // replace them with undef or the input value.  We must do this for
+    // correctness, because 0-operand phis are not valid.
+    PN = cast<PHINode>(NewBB->begin());
+    if (PN->getNumIncomingValues() == 0) {
+      BasicBlock::iterator I = NewBB->begin();
+      BasicBlock::const_iterator OldI = OldBB->begin();
+      while ((PN = dyn_cast<PHINode>(I++))) {
+        Value *NV = UndefValue::get(PN->getType());
+        PN->replaceAllUsesWith(NV);
+        assert(VMap[OldI] == PN && "VMap mismatch");
+        VMap[OldI] = NV;
+        PN->eraseFromParent();
+        ++OldI;
+      }
+    }
+  }
+
+  // Make a second pass over the PHINodes now that all of them have been
+  // remapped into the new function, simplifying the PHINode and performing any
+  // recursive simplifications exposed. This will transparently update the
+  // WeakVH in the VMap. Notably, we rely on that so that if we coalesce
+  // two PHINodes, the iteration over the old PHIs remains valid, and the
+  // mapping will just map us to the new node (which may not even be a PHI
+  // node).
+  for (unsigned Idx = 0, Size = PHIToResolve.size(); Idx != Size; ++Idx)
+    if (PHINode *PN = dyn_cast<PHINode>(VMap[PHIToResolve[Idx]]))
+      recursivelySimplifyInstruction(PN);
+
+  // Now that the inlined function body has been fully constructed, go through
+  // and zap unconditional fall-through branches. This happens all the time when
+  // specializing code: code specialization turns conditional branches into
+  // uncond branches, and this code folds them.
+  Function::iterator Begin = cast<BasicBlock>(VMap[StartingBB]);
+  Function::iterator I = Begin;
+  while (I != NewFunc->end()) {
+    // Check if this block has become dead during inlining or other
+    // simplifications. Note that the first block will appear dead, as it has
+    // not yet been wired up properly.
+    if (I != Begin && (pred_begin(I) == pred_end(I) ||
+                       I->getSinglePredecessor() == I)) {
+      BasicBlock *DeadBB = I++;
+      DeleteDeadBlock(DeadBB);
+      continue;
+    }
+
+    // We need to simplify conditional branches and switches with a constant
+    // operand. We try to prune these out when cloning, but if the
+    // simplification required looking through PHI nodes, those are only
+    // available after forming the full basic block. That may leave some here,
+    // and we still want to prune the dead code as early as possible.
+    ConstantFoldTerminator(I);
+
+    BranchInst *BI = dyn_cast<BranchInst>(I->getTerminator());
+    if (!BI || BI->isConditional()) { ++I; continue; }
+    
+    BasicBlock *Dest = BI->getSuccessor(0);
+    if (!Dest->getSinglePredecessor()) {
+      ++I; continue;
+    }
+
+    // We shouldn't be able to get single-entry PHI nodes here, as instsimplify
+    // above should have zapped all of them..
+    assert(!isa<PHINode>(Dest->begin()));
+
+    // We know all single-entry PHI nodes in the inlined function have been
+    // removed, so we just need to splice the blocks.
+    BI->eraseFromParent();
+    
+    // Make all PHI nodes that referred to Dest now refer to I as their source.
+    Dest->replaceAllUsesWith(I);
+
+    // Move all the instructions in the succ to the pred.
+    I->getInstList().splice(I->end(), Dest->getInstList());
+    
+    // Remove the dest block.
+    Dest->eraseFromParent();
+    
+    // Do not increment I, iteratively merge all things this block branches to.
+  }
+
+  // Make a final pass over the basic blocks from the old function to gather
+  // any return instructions which survived folding. We have to do this here
+  // because we can iteratively remove and merge returns above.
+  for (Function::iterator I = cast<BasicBlock>(VMap[StartingBB]),
                           E = NewFunc->end();
        I != E; ++I)
     if (ReturnInst *RI = dyn_cast<ReturnInst>(I->getTerminator()))
